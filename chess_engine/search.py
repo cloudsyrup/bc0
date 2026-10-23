@@ -24,6 +24,10 @@ class Search:
             white_score = self.evaluator.predict_board(board) * 100
         else:
             white_score = 0
+            pawn_squares = {
+                chess.WHITE: board.pieces(chess.PAWN, chess.WHITE),
+                chess.BLACK: board.pieces(chess.PAWN, chess.BLACK),
+            }
             for sq, piece in board.piece_map().items():
                 sign = 1 if piece.color else -1
                 rank = chess.square_rank(sq) if piece.color else 7 - chess.square_rank(sq)
@@ -33,6 +37,25 @@ class Search:
                 elif piece.piece_type in (chess.KNIGHT, chess.BISHOP): bonus = center * 7
                 elif piece.piece_type == chess.KING and board.fullmove_number > 30: bonus = center * 4
                 white_score += sign * (VALUES[piece.piece_type] + bonus)
+            # Reward passed pawns and bishop pairs; penalize doubled pawns.
+            for color, sign in ((chess.WHITE, 1), (chess.BLACK, -1)):
+                own = pawn_squares[color]
+                enemy = pawn_squares[not color]
+                file_counts = {}
+                for sq in own:
+                    file_ = chess.square_file(sq)
+                    file_counts[file_] = file_counts.get(file_, 0) + 1
+                white_score -= sign * sum(max(0, n - 1) * 12 for n in file_counts.values())
+                for sq in own:
+                    file_, rank = chess.square_file(sq), chess.square_rank(sq)
+                    forward_enemy = [esq for esq in enemy if
+                                     (chess.square_rank(esq) > rank if color else
+                                      chess.square_rank(esq) < rank)]
+                    if not any(abs(chess.square_file(esq) - file_) <= 1 for esq in forward_enemy):
+                        relative_rank = rank if color else 7 - rank
+                        white_score += sign * (12 + relative_rank * 8)
+                if len(board.pieces(chess.BISHOP, color)) >= 2:
+                    white_score += sign * 28
         return int(white_score if board.turn else -white_score)
 
     def _draw(self, board, ply):
@@ -66,13 +89,13 @@ class Search:
                 attacker = board.piece_at(move.from_square)
                 return 1_000_000 + victim_value * 10 - (VALUES[attacker.piece_type] if attacker else 0)
             if move.promotion: return 900_000 + VALUES[move.promotion]
-            if self.killers.get(ply) == move: return 800_000
+            if move in self.killers.get(ply, ()): return 800_000 - self.killers[ply].index(move)
             return self.history.get((board.turn, move.from_square, move.to_square), 0)
         return sorted(board.legal_moves if moves is None else moves, key=score, reverse=True)
 
     def _qsearch(self, board, alpha, beta, ply):
         self.nodes += 1
-        if (self.nodes & 1023) == 0 and self._check_stop(): return self.evaluate(board)
+        if (self.nodes & 255) == 0 and self._check_stop(): return self.evaluate(board)
         if self._draw(board, ply): return 0
         if board.is_check():
             best = -INF
@@ -96,7 +119,7 @@ class Search:
 
     def _search(self, board, depth, alpha, beta, ply):
         self.nodes += 1
-        if (self.nodes & 1023) == 0 and self._check_stop(): return self.evaluate(board)
+        if (self.nodes & 255) == 0 and self._check_stop(): return self.evaluate(board)
         if self._draw(board, ply): return 0
         if board.is_checkmate(): return -MATE + ply
         if depth <= 0: return self._qsearch(board, alpha, beta, ply)
@@ -149,9 +172,14 @@ class Search:
             if score > alpha: alpha = score
             if alpha >= beta:
                 if not is_capture:
-                    self.killers[ply] = move
+                    killers = self.killers.setdefault(ply, [])
+                    if move not in killers:
+                        killers.insert(0, move)
+                        del killers[2:]
                     k = (board.turn, move.from_square, move.to_square)
-                    self.history[k] = self.history.get(k, 0) + depth * depth
+                    bonus = depth * depth
+                    old = self.history.get(k, 0)
+                    self.history[k] = max(-16384, min(16384, old + bonus - old * bonus // 16384))
                 break
         bound = 2 if best <= original_alpha else (1 if best >= beta else 0)
         if len(self.tt) >= self.tt_limit: self.tt.clear()

@@ -1,78 +1,94 @@
-# Chess Neural Search Engine
+# Blunder 0 (BC0)
 
-A UCI chess engine written in Python. It combines a neural position evaluator trained on FEN and evaluation with iterative deepening, negamax minimax, alpha-beta pruning, quiescence search, move ordering, and a transposition table. UCI support lets standard chess GUI programs launch it as an external engine.
+**Blunder 0**, also known as **BC0**, is a UCI-compatible chess engine written in Python. It searches positions with iterative deepening, negamax, alpha-beta pruning, quiescence search, and a transposition table. Its evaluator can use either a trained NumPy neural network or a built-in material and positional evaluation.
 
-## Project layout
+## Features
 
-```text
-Chess/
-├── evaluated.csv             # supplied training data
-├── chess_engine/
-│   ├── __main__.py            # command line entry point
-│   ├── features.py            # position encoding used by training and engine
-│   ├── network.py             # NumPy neural model and trainer
-│   ├── search.py              # minimax search and fallback evaluator
-│   └── uci.py                 # GUI protocol
-├── models/                    # trained evaluator is saved here
-├── requirements.txt
-└── build_exe.ps1
-```
+- UCI support for chess GUIs such as Arena, Cute Chess, and Banksia
+- Iterative deepening with principal-variation search and aspiration windows
+- Alpha-beta pruning, late-move reductions, and guarded null-move pruning
+- Quiescence search, move ordering, killer moves, and history heuristics
+- Transposition table that persists across moves in a game
+- Neural evaluator training from FEN and evaluation data
+- Built-in fallback evaluation when no model is loaded
 
-## Install and train
+## Requirements
 
-Use Python 3.10 or newer. From PowerShell in this folder:
+- Python 3.10 or newer
+- Dependencies listed in [`requirements.txt`](requirements.txt)
+
+Install the dependencies in a virtual environment:
 
 ```powershell
 py -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-python -m chess_engine train evaluated.csv --output models\evaluator.npz
 ```
 
-The default run uses **all rows** (the supplied CSV has 713,000 data rows), 5 epochs, batch size 256, hidden width 64, and 4 BLAS threads. It reads and shuffles 8,192-position chunks, then trains each chunk in mini-batches; it never loads the full feature dataset into RAM. These defaults leave CPU headroom on a 6-core processor. Use `--threads 2 --batch-size 128` to make it lighter, or `--threads 6 --batch-size 512` to use more CPU. For example, this lower-load command still includes all positions:
+## Run in a chess GUI
 
-```powershell
-python -m chess_engine train evaluated.csv --output models\evaluator.npz --threads 2 --batch-size 128
-```
-
-Training accepts `--epochs`, `--batch-size`, `--hidden`, `--learning-rate`, `--limit`, `--seed`, `--chunk-size`, and `--threads`. `--limit 100000` trains on only the first 100,000 rows; omit it (or use zero) to use the entire file. Chunk progress and each epoch's mean Huber loss are printed. The model is a two-hidden-layer tanh MLP trained with Adam. It reads the `FEN` and `evaluation` columns, skips invalid rows, clips extreme labels to +/-20, and assumes evaluations are in pawn units from White's point of view. If your labels use centipawns, divide them by 100 before training or the evaluator scale will be wrong.
-
-The model input represents all piece/color/square occupancies, side to move, and castling rights. The same feature encoder is used at training and search time. If no trained model is loaded, the engine uses a material and piece-square evaluator.
-
-## Run from a chess GUI
-
-UCI mode is the default:
+Start BC0 in UCI mode:
 
 ```powershell
 python -m chess_engine
 ```
 
-In a UCI-compatible GUI, add an engine and point its executable to the Python interpreter in `.venv\Scripts\python.exe`; set its arguments to `-m chess_engine`. In the engine options, set `EvalFile` to the full path of `models\evaluator.npz`. Set `Depth` (default 8) and `Hash` (transposition-table budget in MB) in the GUI. The engine also accepts standard `go depth`, `go movetime`, and clock commands from the GUI. Greater depth takes substantially longer; available search depth is configurable from 1 to 30.
+In your chess GUI, add a UCI engine with your Python interpreter as the executable and `-m chess_engine` as the argument. The engine identifies itself as **Blunder 0**. Configure the `Depth` and `Hash` options in the GUI. To load a trained evaluator, set `EvalFile` to its full path.
 
-You can start the UCI engine with a depth default from the command line:
+You can also start the engine with a default search depth:
 
 ```powershell
 python -m chess_engine uci --depth 10
 ```
 
-### Building the standalone Windows executable
+The GUI can override the default depth with `go depth`, or use `go movetime` and clock commands. Search depth can be set from 1 to 30. Higher depths can take substantially longer.
 
-With the virtual environment active and dependencies installed:
+## Train a neural evaluator
+
+Training data must be a CSV containing `FEN` and `evaluation` columns. Evaluations should be in pawn units from White's point of view. If your data is in centipawns, divide the scores by 100 before training.
+
+Train with the default settings:
+
+```powershell
+python -m chess_engine train evaluated.csv --output models\evaluator.npz
+```
+
+The trainer reads the CSV in chunks rather than loading all features into memory. Defaults are 5 epochs, batch size 256, hidden width 64, and 4 BLAS threads. You can adjust these settings:
+
+```powershell
+python -m chess_engine train evaluated.csv `
+  --output models\evaluator.npz `
+  --epochs 5 --batch-size 256 --hidden 64 --threads 4
+```
+
+Other options include `--learning-rate`, `--limit`, `--seed`, and `--chunk-size`. Use `--limit 100000` to train on at most the first 100,000 CSV rows; omit it to use all rows. Set the UCI `EvalFile` option to the generated model to use it during play.
+
+## Build a Windows executable
+
+With dependencies installed, run:
 
 ```powershell
 Set-ExecutionPolicy -Scope Process Bypass
 .\build_exe.ps1
 ```
 
-This creates `dist\ChessEngine.exe`. Add that executable to the GUI as a UCI engine. Set the GUI's `EvalFile` option to the model path (for example, `C:\path\to\Chess\models\evaluator.npz`). The model is intentionally a separate file so you can retrain it without rebuilding the executable. Build on Windows to create a Windows executable.
+The executable is created at `dist\ChessEngine.exe`. The evaluator model remains a separate file and can be selected through `EvalFile`.
 
-## Search outline
+## Project layout
 
-At each iteration the engine searches the root to the configured depth. Negamax evaluates from the side-to-move perspective; alpha-beta cuts branches that cannot change the result. Principal-variation search uses a narrow window after the first move, aspiration windows reuse the previous iteration's score, and late-move reductions search late quiet moves at reduced depth before re-searching any that improve alpha. Guarded null-move pruning cuts branches where passing the turn still exceeds beta; it is disabled in check and pawn-only endings. Quiescence search follows captures and promotions, and searches all legal evasions when in check. The engine orders transposition-table moves, captures by victim value, promotions, killer moves, and history-scored moves. Its transposition table persists across moves in one game and clears on `ucinewgame`. Iterative deepening reports the last fully completed result, so UCI `stop` can return a legal move while a deeper iteration is underway. Fifty-move, repetition, stalemate, and insufficient-material draws are recognized.
+```text
+chess_engine/
+├── __main__.py   # Command-line entry point
+├── features.py   # Position encoding shared by training and evaluation
+├── network.py    # NumPy neural evaluator and trainer
+├── search.py     # Position evaluation and search
+└── uci.py        # UCI protocol adapter
+engine.py         # Compatibility entry point
+requirements.txt
+build_exe.ps1
+```
 
-## Notes
+## Limitations
 
-- This is a compact CPU-oriented engine and baseline neural model, not a Stockfish-strength engine. Search quality depends on the labels, their units and perspective, model training, and available time.
-- UCI scores are reported in centipawns; mate scores are reported in moves. Evaluation labels must use White's perspective as noted above.
-- The `Depth` UCI option is the default for `go` commands without an explicit depth. A GUI may override it per search.
+BC0 is a compact, CPU-oriented engine and is not at Stockfish strength. Its playing strength depends on search time and, when used, the quality and score conventions of the training data.
