@@ -1,9 +1,18 @@
-# Small NumPy MLP evaluator, trained from the supplied FEN/evaluation CSV.
 from pathlib import Path
+import re
 import numpy as np
 from .features import FEATURES
 
 
+def parse_evaluation(value: str) -> float:
+    """Parse a white-relative pawn score or a PGN mate score (for example, #-3)."""
+    value = value.strip()
+    mate = re.fullmatch(r"#([+-]?\d+)", value)
+    if mate:
+        # Mate scores have no pawn-equivalent value. Use the existing target
+        # ceiling so a forced mate is learned as a decisive result.
+        return 20.0 if int(mate.group(1)) > 0 else -20.0
+    return float(value)
 
 class Evaluator:
     def __init__(self, path: str | Path):
@@ -64,7 +73,7 @@ def train(csv_path: str | Path, output: str | Path, epochs=5, batch_size=256,
                 seen += 1
                 try:
                     board = chess.Board(row["FEN"])
-                    score = float(row["evaluation"])
+                    score = parse_evaluation(row["evaluation"])
                     if not np.isfinite(score):
                         continue
                     rows_x.append(encode(board))

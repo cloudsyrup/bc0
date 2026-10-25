@@ -18,6 +18,9 @@ class Search:
         self.deadline = None
         self.killers = {}
         self.history = {}
+        self.countermoves = {}
+        self.generation = 0
+        self._next_check = 256
 
     def evaluate(self, board):
         if self.evaluator:
@@ -56,6 +59,95 @@ class Search:
                         white_score += sign * (12 + relative_rank * 8)
                 if len(board.pieces(chess.BISHOP, color)) >= 2:
                     white_score += sign * 28
+
+        # Add interpretable positional terms to both the handcrafted and neural
+        # evaluations. Values are centipawns and remain deliberately modest.
+        opening = max(0.0, min(1.0, (board.fullmove_number - 8) / 18.0))
+        opening = 1.0 - opening
+        center_squares = (chess.E4, chess.D4, chess.E5, chess.D5)
+        for color, sign in ((chess.WHITE, 1), (chess.BLACK, -1)):
+            enemy = not color
+            own_pawns = board.pieces(chess.PAWN, color)
+            enemy_pawns = board.pieces(chess.PAWN, enemy)
+
+            # Central pawn occupation and piece influence over e4/d4/e5/d5.
+            for sq in center_squares:
+                if board.piece_type_at(sq) == chess.PAWN and board.color_at(sq) == color:
+                    white_score += sign * 12
+                influence = len(board.attackers(color, sq)) - len(board.attackers(enemy, sq))
+                white_score += sign * influence * 4
+
+            # Reward early minor-piece development, especially to useful central
+            # squares; penalize leaving both knights and bishops at home.
+            undeveloped = 0
+            minor_count = len(board.pieces(chess.KNIGHT, color)) + len(board.pieces(chess.BISHOP, color))
+            for piece_type, starts in (
+                (chess.KNIGHT, (chess.B1, chess.G1) if color else (chess.B8, chess.G8)),
+                (chess.BISHOP, (chess.C1, chess.F1) if color else (chess.C8, chess.F8)),
+            ):
+                for start in starts:
+                    piece = board.piece_at(start)
+                    if piece and piece.color == color and piece.piece_type == piece_type:
+                        white_score -= sign * 12 * opening
+                        undeveloped += 1
+            developed = max(0, minor_count - undeveloped)
+            white_score += sign * developed * 7 * opening
+
+            # Encourage castling and penalize an uncastled king exposed in the
+            # opening, especially when its central file has opened.
+            king_sq = board.king(color)
+            if king_sq is not None:
+                king_file = chess.square_file(king_sq)
+                king_rank = chess.square_rank(king_sq)
+                home_rank = 0 if color else 7
+                castled = king_rank == home_rank and king_file in (2, 6)
+                if castled:
+                    white_score += sign * 22 * opening
+                elif board.has_castling_rights(color) and king_file == 4:
+                    white_score -= sign * 10 * opening
+                if opening and not castled:
+                    ring = chess.SquareSet(chess.BB_KING_ATTACKS[king_sq])
+                    attacked = sum(board.is_attacked_by(enemy, sq) for sq in ring)
+                    white_score -= sign * int(attacked * 2 * opening)
+
+            # Penalize isolated and backward-looking pawn structure, plus early
+            # flank pawn pushes that expose an uncastled king.
+            pawn_files = {chess.square_file(sq) for sq in own_pawns}
+            for sq in own_pawns:
+                file_ = chess.square_file(sq)
+                if file_ - 1 not in pawn_files and file_ + 1 not in pawn_files:
+                    white_score -= sign * 10
+                relative_rank = chess.square_rank(sq) if color else 7 - chess.square_rank(sq)
+                if opening and file_ in (1, 2, 5, 6) and relative_rank >= 3:
+                    king_sq = board.king(color)
+                    if king_sq is not None and chess.square_rank(king_sq) == (0 if color else 7) and chess.square_file(king_sq) == 4:
+                        white_score -= sign * 5 * opening
+
+            # Reward useful coordination: developed pieces supporting the center
+            # and one another rather than merely having many legal destinations.
+            for sq, piece in board.piece_map().items():
+                if piece.color != color or piece.piece_type not in (chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN):
+                    continue
+                if sq in center_squares:
+                    white_score += sign * 5
+                if board.is_attacked_by(color, sq):
+                    white_score += sign * 3
+                useful = sum(board.attacks(sq) & chess.BB_SQUARES[target] != 0 for target in center_squares)
+                white_score += sign * useful * 2
+
+        # Mild history-aware tempo penalty when the same side has just moved the
+        # same piece back and forth; keep the penalty small so useful retreats
+        # still win when the tactical position calls for them.
+        if len(board.move_stack) >= 4:
+            recent = board.move_stack[-4:]
+            for index in (0, 1):
+                first, second = recent[index], recent[index + 2]
+                if (first.from_square == second.to_square and
+                        first.to_square == second.from_square and
+                        not board.is_check()):
+                    mover = board.turn if index == 1 else not board.turn
+                    white_score -= (1 if mover else -1) * 8
+                    break
         return int(white_score if board.turn else -white_score)
 
     def _draw(self, board, ply):
@@ -80,22 +172,33 @@ class Search:
         return self.stop
 
     def _ordered(self, board, tt_move=None, ply=0, moves=None):
+        # MVV-LVA plus a small SEE-like penalty for obviously losing captures.
+        # Keep ordering local: sorting is much cheaper than repeatedly querying
+        # attack maps for a full static exchange evaluation in Python.
+        killers = self.killers.get(ply, ())
+        previous = board.peek() if board.move_stack else None
+        counter = self.countermoves.get((previous.to_square, previous.from_square)) if previous else None
+        history = self.history
+        color = board.turn
         def score(move):
             if move == tt_move: return 10_000_000
+            if move.promotion: return 2_000_000 + VALUES[move.promotion]
             if board.is_capture(move):
                 victim = board.piece_at(move.to_square)
-                if board.is_en_passant(move): victim_value = VALUES[chess.PAWN]
-                else: victim_value = VALUES[victim.piece_type] if victim else 0
+                victim_value = VALUES[chess.PAWN] if board.is_en_passant(move) else VALUES[victim.piece_type] if victim else 0
                 attacker = board.piece_at(move.from_square)
-                return 1_000_000 + victim_value * 10 - (VALUES[attacker.piece_type] if attacker else 0)
-            if move.promotion: return 900_000 + VALUES[move.promotion]
-            if move in self.killers.get(ply, ()): return 800_000 - self.killers[ply].index(move)
-            return self.history.get((board.turn, move.from_square, move.to_square), 0)
+                attacker_value = VALUES[attacker.piece_type] if attacker else 0
+                return 1_000_000 + victim_value * 16 - attacker_value
+            if move in killers: return 800_000 - killers.index(move)
+            if move == counter: return 700_000
+            return history.get((color, move.from_square, move.to_square), 0)
         return sorted(board.legal_moves if moves is None else moves, key=score, reverse=True)
 
     def _qsearch(self, board, alpha, beta, ply):
         self.nodes += 1
-        if (self.nodes & 255) == 0 and self._check_stop(): return self.evaluate(board)
+        if self.nodes >= self._next_check:
+            self._next_check = self.nodes + 256
+            if self._check_stop(): return self.evaluate(board)
         if self._draw(board, ply): return 0
         if board.is_check():
             best = -INF
@@ -119,16 +222,17 @@ class Search:
 
     def _search(self, board, depth, alpha, beta, ply):
         self.nodes += 1
-        if (self.nodes & 255) == 0 and self._check_stop(): return self.evaluate(board)
+        if self.nodes >= self._next_check:
+            self._next_check = self.nodes + 256
+            if self._check_stop(): return self.evaluate(board)
         if self._draw(board, ply): return 0
-        if board.is_checkmate(): return -MATE + ply
         if depth <= 0: return self._qsearch(board, alpha, beta, ply)
         original_alpha = alpha
         key = self._key(board)
         entry = self.tt.get(key)
         tt_move = None
         if entry:
-            td, ts, bound, tm = entry
+            td, ts, bound, tm, _ = entry
             ts = self._from_tt(ts, ply)
 
             tt_move = tm
@@ -141,14 +245,19 @@ class Search:
         # Null-move pruning cuts branches when even passing the turn is sufficient
         # to exceed beta. Disable it in check and in pawn-only endings (zugzwang risk).
         if (depth >= 3 and ply > 0 and not in_check and
-                (not board.move_stack or not board.peek().is_null()) and beta < MATE - 1000 and
+                (not board.move_stack or board.peek() != chess.Move.null()) and beta < MATE - 1000 and
                 any(board.pieces(pt, board.turn) for pt in (chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN))):
-            reduction = 2 + depth // 6
+            reduction = 2 + depth // 5
             board.push(chess.Move.null())
             null_score = -self._search(board, depth - 1 - reduction, -beta, -beta + 1, ply + 1)
             board.pop()
             if self.stop: return null_score
-            if null_score >= beta: return null_score
+            if null_score >= beta:
+                # Verify deep null cutoffs to avoid zugzwang and evaluation-noise errors.
+                if depth < 7: return null_score
+                verify = self._search(board, depth - 1 - reduction, beta - 1, beta, ply)
+                if self.stop: return verify
+                if verify >= beta: return verify
 
         moves = self._ordered(board, tt_move, ply)
         if not moves: return -MATE + ply if board.is_check() else 0
@@ -159,7 +268,9 @@ class Search:
             child_depth = depth - 1
             # Late-move reductions: spend less effort on quiet moves ordered late,
             # then restore the full search if the reduced search improves alpha.
-            reduction = 1 if depth >= 3 and move_index >= 4 and not is_capture and not gives_check and not in_check else 0
+            reduction = 0
+            if depth >= 3 and move_index >= 4 and not is_capture and not gives_check and not in_check:
+                reduction = 1 + int(depth >= 6 and move_index >= 10)
             if move_index == 0:
                 score = -self._search(board, child_depth, -beta, -alpha, ply + 1)
             else:
@@ -180,10 +291,23 @@ class Search:
                     bonus = depth * depth
                     old = self.history.get(k, 0)
                     self.history[k] = max(-16384, min(16384, old + bonus - old * bonus // 16384))
+                    if board.move_stack and board.peek() != chess.Move.null():
+                        previous = board.peek()
+                        self.countermoves[(previous.to_square, previous.from_square)] = move
                 break
         bound = 2 if best <= original_alpha else (1 if best >= beta else 0)
-        if len(self.tt) >= self.tt_limit: self.tt.clear()
-        self.tt[key] = (depth, self._to_tt(best, ply), bound, best_move)
+        entry = self.tt.get(key)
+        # Prefer deeper entries; refresh same-position entries from this search.
+        if entry is None or depth >= entry[0] or entry[4] != self.generation:
+            self.tt[key] = (depth, self._to_tt(best, ply), bound, best_move, self.generation)
+        if len(self.tt) > self.tt_limit + max(1, self.tt_limit // 8):
+            # Evict a small, old sample instead of dropping the whole hash table.
+            stale = [k for k, v in self.tt.items() if v[4] != self.generation]
+            for old_key in stale[:max(1, self.tt_limit // 8)]:
+                del self.tt[old_key]
+            if len(self.tt) > self.tt_limit:
+                for old_key in list(self.tt)[:max(1, self.tt_limit // 8)]:
+                    del self.tt[old_key]
         return best
 
     @staticmethod
@@ -201,11 +325,16 @@ class Search:
 
     def run(self, board, depth=8, movetime=None):
         self.nodes, self.stop, self.killers, self.history = 0, False, {}, {}
-        self.deadline = time.monotonic() + movetime if movetime else None
+        self.countermoves = {}
+        self._next_check = 256
+        self.generation += 1
+        self.deadline = time.monotonic() + max(0.0, movetime) if movetime is not None else None
         best_move = next(iter(board.legal_moves), None)
         if best_move is None: return None, 0
         best_score = 0
         for d in range(1, max(1, depth) + 1):
+            if self.deadline is not None and self.deadline <= time.monotonic():
+                break
             window = 35 if d >= 3 else INF
             alpha, beta = max(-INF, best_score - window), min(INF, best_score + window)
             score = self._search(board, d, alpha, beta, 0)

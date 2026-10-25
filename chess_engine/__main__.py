@@ -15,7 +15,8 @@ def main():
     p.add_argument("--seed", type=int, default=7)
     p.add_argument("--chunk-size", type=int, default=8192, help="positions buffered before shuffling/training")
     p.add_argument("--threads", type=int, default=4, help="BLAS worker threads used for training")
-    p.add_argument("--depth", type=int, default=8, help="search depth for UCI mode")
+    uci = sub.add_parser("uci", help="start the UCI chess engine")
+    uci.add_argument("--depth", type=int, default=8, help="default search depth (1-30)")
     args = parser.parse_args()
     if args.command == "train":
         from .network import train
@@ -24,7 +25,7 @@ def main():
     elif args.command is None or args.command == "uci":
         from .uci import UCI
         engine = UCI()
-        if args.command == "uci": engine.depth = args.depth
+        if args.command == "uci": engine.depth = max(1, min(30, args.depth))
         engine.loop()
 
 if __name__ == "__main__": main()

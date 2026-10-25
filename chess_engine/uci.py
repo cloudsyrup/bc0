@@ -1,4 +1,3 @@
-# UCI protocol adapter. Works with Arena, Cute Chess, Banksia and other UCI GUIs.
 import shlex
 import sys
 import threading

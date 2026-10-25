@@ -7,7 +7,6 @@ FEATURES = 12 * 64 + 5
 
 
 def encode(board: chess.Board) -> np.ndarray:
-    """Encode piece-square occupancy plus side-to-move and castling rights."""
     x = np.zeros(FEATURES, dtype=np.float32)
     for square, piece in board.piece_map().items():
         # Keep white and black on separate planes; mirror black ranks to share patterns.
